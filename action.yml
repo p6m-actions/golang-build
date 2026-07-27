@@ -1,0 +1,286 @@
+name: "Go Build"
+description: "Builds a Go project with flexible codegen, format, vet, lint, test and build commands"
+author: "Ybor / P6M <engineering@ybor.ai>"
+
+# Define the inputs for this action
+inputs:
+  # Code generation. Go services import code that is GENERATED rather than committed, so a fresh
+  # clone does not compile until it has been produced. Generating it here — inside the step that
+  # needs it — is what keeps the CI path and the container build path from drifting apart.
+  run-codegen:
+    description: "Whether to run guarded code generation (protoc for proto/, gqlgen for gqlgen.yml)"
+    required: false
+    default: "true"
+  protoc-gen-go-version:
+    description: "Version of protoc-gen-go to install when it is missing. Keep in step with the production Dockerfile."
+    required: false
+    default: "v1.36.5"
+  protoc-gen-go-grpc-version:
+    description: "Version of protoc-gen-go-grpc to install when it is missing"
+    required: false
+    default: "v1.5.1"
+
+  # Module hygiene
+  run-tidy:
+    description: "Run `go mod tidy`. A freshly rendered project ships no go.sum (producing one needs the toolchain, which rendering does not have), so this materializes it; on a checkout that already has one it is a no-op."
+    required: false
+    default: "true"
+
+  # Format check configuration
+  run-format-check:
+    description: "Whether to check code formatting with gofmt. Defaults OFF: the p6m Go pipeline does not gate on formatting yet, and turning it on fleet-wide is a decision the CI-parity proofs (S10) should carry, not a silent default change."
+    required: false
+    default: "false"
+  format-command:
+    description: "Command whose output lists misformatted files (non-empty output fails the step)"
+    required: false
+    default: "gofmt -l ."
+
+  # Vet configuration
+  run-vet:
+    description: "Whether to run `go vet`. Defaults OFF for the same reason as run-format-check."
+    required: false
+    default: "false"
+  vet-command:
+    description: "Command to run for vetting"
+    required: false
+    default: "go vet"
+  vet-args:
+    description: "Additional arguments for the vet command"
+    required: false
+    default: "./..."
+
+  # Lint configuration
+  run-lint:
+    description: "Whether to run golangci-lint. Defaults OFF: it needs a .golangci.yml the archetypes do not render."
+    required: false
+    default: "false"
+  lint-command:
+    description: "Command to run for linting"
+    required: false
+    default: "golangci-lint run"
+  lint-args:
+    description: "Additional arguments for the lint command"
+    required: false
+    default: ""
+  golangci-lint-version:
+    description: "Version of golangci-lint to install when run-lint is enabled"
+    required: false
+    default: "v1.62.2"
+
+  # Build configuration
+  run-build:
+    description: "Whether to run build"
+    required: false
+    default: "true"
+  build-command:
+    description: "Command to run for building"
+    required: false
+    default: "go build"
+  build-args:
+    description: "Additional arguments for the build command"
+    required: false
+    default: "./..."
+
+  # Test configuration
+  run-test:
+    description: "Whether to run tests"
+    required: false
+    default: "true"
+  test-command:
+    description: "Command to run for testing"
+    required: false
+    default: "go test"
+  test-args:
+    description: "Additional arguments for the test command"
+    required: false
+    default: "./..."
+
+  # Coverage configuration
+  archive-coverage:
+    description: "Whether to archive code coverage results"
+    required: false
+    default: "false"
+  coverage-path:
+    description: "Path to the coverage reports"
+    required: false
+    default: "coverage"
+
+  # Working directory
+  working-directory:
+    description: "Working directory for go commands"
+    required: false
+    default: "."
+
+# Define the outputs for this action
+outputs:
+  build-status:
+    description: "Build status (success or failure)"
+    value: ${{ steps.build-status.outputs.status }}
+
+# Define the runs configuration
+runs:
+  using: "composite"
+  steps:
+    # protoc runs BEFORE tidy: it is a standalone binary rather than a Go tool, so it needs nothing
+    # resolved first — and tidy has to see gen/ to resolve what the service imports from it.
+    - name: Generate gRPC bindings
+      if: inputs.run-codegen == 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        if [ ! -d proto ]; then
+          echo "No proto/ directory — skipping gRPC codegen"
+          exit 0
+        fi
+        echo "::group::Generating gRPC bindings"
+        # Self-sufficient: golang-setup installs these when it sees proto/, but this action must
+        # also work on its own, so install whatever is missing rather than assuming a sibling ran.
+        if ! command -v protoc >/dev/null 2>&1; then
+          sudo apt-get update && sudo apt-get install -y protobuf-compiler
+        fi
+        if ! command -v protoc-gen-go >/dev/null 2>&1; then
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@${{ inputs.protoc-gen-go-version }}
+        fi
+        if ! command -v protoc-gen-go-grpc >/dev/null 2>&1; then
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@${{ inputs.protoc-gen-go-grpc-version }}
+        fi
+        mkdir -p gen
+        protoc -I proto \
+          --go_out=gen --go_opt=paths=source_relative \
+          --go-grpc_out=gen --go-grpc_opt=paths=source_relative \
+          $(find proto -name '*.proto')
+        echo "::endgroup::"
+
+    - name: Tidy modules
+      if: inputs.run-tidy == 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        echo "::group::go mod tidy"
+        go mod tidy || {
+          echo "::error::go mod tidy failed. Please check the logs above for errors."
+          exit 1
+        }
+        echo "::endgroup::"
+
+    # gqlgen runs AFTER tidy, unlike protoc: it is a Go tool invoked through `go run`, so its own
+    # dependency has to be resolvable first. A second tidy picks up what the generated code imports.
+    - name: Generate GraphQL server
+      if: inputs.run-codegen == 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        if [ ! -f gqlgen.yml ]; then
+          echo "No gqlgen.yml — skipping GraphQL codegen"
+          exit 0
+        fi
+        echo "::group::Generating GraphQL server"
+        go run github.com/99designs/gqlgen generate
+        go mod tidy
+        echo "::endgroup::"
+
+    - name: Format Check
+      if: inputs.run-format-check == 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        echo "::group::Running Format Check"
+        CMD="${{ inputs.format-command }}"
+        echo "Running command: $CMD"
+        # gofmt reports misformatted files on stdout and still exits 0, so the OUTPUT is the verdict.
+        UNFORMATTED="$($CMD)"
+        if [ -n "$UNFORMATTED" ]; then
+          echo "::error::Format check failed. Run 'gofmt -w .' to fix these files:"
+          echo "$UNFORMATTED"
+          exit 1
+        fi
+        echo "All files are formatted."
+        echo "::endgroup::"
+
+    - name: Vet
+      if: inputs.run-vet == 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        echo "::group::Running Vet"
+        CMD="${{ inputs.vet-command }} ${{ inputs.vet-args }}"
+        echo "Running command: $CMD"
+        $CMD || {
+          echo "::error::go vet failed. Please check the logs above for errors."
+          exit 1
+        }
+        echo "::endgroup::"
+
+    - name: Install golangci-lint
+      if: inputs.run-lint == 'true'
+      shell: bash
+      run: |
+        echo "::group::Installing golangci-lint"
+        go install github.com/golangci/golangci-lint/cmd/golangci-lint@${{ inputs.golangci-lint-version }}
+        echo "::endgroup::"
+
+    - name: Lint
+      if: inputs.run-lint == 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        echo "::group::Running Lint"
+        CMD="${{ inputs.lint-command }} ${{ inputs.lint-args }}"
+        echo "Running command: $CMD"
+        $CMD || {
+          echo "::error::Linting failed. Please check the logs above for errors."
+          exit 1
+        }
+        echo "::endgroup::"
+
+    - name: Build
+      if: inputs.run-build == 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        echo "::group::Running Build"
+        CMD="${{ inputs.build-command }} ${{ inputs.build-args }}"
+        echo "Running command: $CMD"
+        $CMD || {
+          echo "::error::Build failed. Please check the logs above for errors."
+          exit 1
+        }
+        echo "::endgroup::"
+
+    - name: Test
+      if: inputs.run-test == 'true'
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      run: |
+        echo "::group::Running Tests"
+        CMD="${{ inputs.test-command }} ${{ inputs.test-args }}"
+        echo "Running command: $CMD"
+        $CMD || {
+          echo "::error::Tests failed. Please check the logs above for errors."
+          exit 1
+        }
+        echo "::endgroup::"
+
+    - name: Archive code coverage results
+      if: inputs.archive-coverage == 'true' && inputs.run-test == 'true'
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-coverage-report
+        path: ${{ inputs.working-directory }}/${{ inputs.coverage-path }}
+
+    - name: Set build status
+      id: build-status
+      if: always()
+      shell: bash
+      run: |
+        if [ "${{ job.status }}" == "success" ]; then
+          echo "status=success" >> $GITHUB_OUTPUT
+        else
+          echo "status=failure" >> $GITHUB_OUTPUT
+        fi
+
+# Define the branding for the action in the GitHub Marketplace
+branding:
+  icon: "package"
+  color: "blue"
