@@ -28,9 +28,9 @@ inputs:
 
   # Format check configuration
   run-format-check:
-    description: "Whether to check code formatting with gofmt. Defaults OFF: the p6m Go pipeline does not gate on formatting yet, and turning it on fleet-wide is a decision the CI-parity proofs (S10) should carry, not a silent default change."
+    description: "Whether to check code formatting with gofmt. On by default: `gofmt` is Go's own canonical formatter, needs no configuration, and is the direct analogue of the `cargo fmt --check` and `ruff` gates the other ecosystems already run."
     required: false
-    default: "false"
+    default: "true"
   format-command:
     description: "Command whose output lists misformatted files (non-empty output fails the step)"
     required: false
@@ -38,9 +38,9 @@ inputs:
 
   # Vet configuration
   run-vet:
-    description: "Whether to run `go vet`. Defaults OFF for the same reason as run-format-check."
+    description: "Whether to run `go vet`. On by default: it ships with the toolchain, needs no configuration, and catches the class of mistake that compiles but is wrong (bad Printf verbs, unreachable code, lost struct tags)."
     required: false
-    default: "false"
+    default: "true"
   vet-command:
     description: "Command to run for vetting"
     required: false
@@ -52,7 +52,7 @@ inputs:
 
   # Lint configuration
   run-lint:
-    description: "Whether to run golangci-lint. Defaults OFF: it needs a .golangci.yml the archetypes do not render."
+    description: "Whether to run golangci-lint. Still OFF by default, unlike the gofmt and vet gates: it is a third-party meta-linter whose enabled set changes between its own releases, so a repo that passes today can fail on a version bump it did not ask for. Adopt it per repo with a checked-in .golangci.yml."
     required: false
     default: "false"
   lint-command:
