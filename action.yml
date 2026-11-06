@@ -264,7 +264,7 @@ runs:
 
     - name: Archive code coverage results
       if: inputs.archive-coverage == 'true' && inputs.run-test == 'true'
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v6
       with:
         name: test-coverage-report
         path: ${{ inputs.working-directory }}/${{ inputs.coverage-path }}
